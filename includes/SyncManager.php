@@ -458,5 +458,326 @@ class SyncManager {
             ':message' => $message
         ]);
     }
+	/**
+     * Pazaryerinden ürünleri çek (RESİMLERLE BİRLİKTE)
+     */
+    public function syncProductsFromMarketplace($marketplace) {
+        try {
+            $settings = $this->getMarketplaceSettings($marketplace);
+            if (!$settings || !$settings['is_active']) {
+                return ['success' => false, 'message' => "$marketplace entegrasyonu aktif değil"];
+            }
+            
+            $api = $this->getMarketplaceAPI($marketplace, $settings);
+            
+            // Pazaryerinden ürünleri çek
+            $products = [];
+            if ($marketplace == 'trendyol') {
+                $response = $api->getProducts(0, 200);
+                $products = $response['content'] ?? [];
+            } 
+            elseif ($marketplace == 'hepsiburada') {
+                $response = $api->getProducts(0, 200);
+                $products = $response['listings'] ?? [];
+            }
+            elseif ($marketplace == 'n11') {
+                $response = $api->getProducts(0, 200);
+                $products = $response['products']['product'] ?? [];
+            }
+            
+            $syncedCount = 0;
+            $imageCount = 0;
+            
+            foreach ($products as $productData) {
+                try {
+                    // Ürünü normalize et
+                    $normalizedProduct = $this->normalizeProductData($marketplace, $productData);
+                    if (!$normalizedProduct) continue;
+                    
+                    // Ürünü kaydet
+                    $productId = $this->saveProductData($normalizedProduct);
+                    
+                    // Pazaryeri eşleştirmesini kaydet
+                    $this->saveMarketplaceMappingData($productId, $marketplace, $normalizedProduct);
+                    
+                    // Ana resmi indir
+                    if (!empty($normalizedProduct['image_url'])) {
+                        $downloaded = $this->downloadProductImage($productId, $normalizedProduct['image_url'], $marketplace);
+                        if ($downloaded) $imageCount++;
+                    }
+                    
+                    // Ek resimleri indir
+                    if (!empty($normalizedProduct['additional_images'])) {
+                        $this->downloadAdditionalImages($productId, $normalizedProduct['additional_images'], $marketplace);
+                        $imageCount += count($normalizedProduct['additional_images']);
+                    }
+                    
+                    $syncedCount++;
+                } catch (Exception $e) {
+                    error_log("Ürün senkronizasyon hatası: " . $e->getMessage());
+                }
+            }
+            
+            $this->logSync($marketplace, 'product_import', 'success', 
+                "{$syncedCount} ürün, {$imageCount} resim içe aktarıldı");
+            
+            return [
+                'success' => true, 
+                'message' => "{$syncedCount} ürün ve {$imageCount} resim içe aktarıldı"
+            ];
+            
+        } catch (Exception $e) {
+            $this->logSync($marketplace, 'product_import', 'error', $e->getMessage());
+            return ['success' => false, 'message' => 'Hata: ' . $e->getMessage()];
+        }
+    }
+    
+    /**
+     * Ürünü normalize et
+     */
+    private function normalizeProductData($marketplace, $data) {
+        if ($marketplace == 'trendyol') {
+            $images = [];
+            if (!empty($data['images']) && is_array($data['images'])) {
+                foreach ($data['images'] as $img) {
+                    if (!empty($img['url'])) $images[] = $img['url'];
+                }
+            }
+            
+            return [
+                'marketplace_product_id' => $data['id'] ?? '',
+                'marketplace_sku' => $data['productCode'] ?? '',
+                'sku' => $data['stockCode'] ?? $data['barcode'] ?? '',
+                'barcode' => $data['barcode'] ?? '',
+                'name' => $data['title'] ?? '',
+                'description' => $data['description'] ?? '',
+                'price' => $data['salePrice'] ?? 0,
+                'stock' => $data['quantity'] ?? 0,
+                'image_url' => $images[0] ?? '',
+                'additional_images' => array_slice($images, 1)
+            ];
+        }
+        elseif ($marketplace == 'hepsiburada') {
+            $images = $data['images'] ?? [];
+            
+            return [
+                'marketplace_product_id' => $data['hepsiburadaSku'] ?? '',
+                'marketplace_sku' => $data['merchantSku'] ?? '',
+                'sku' => $data['merchantSku'] ?? '',
+                'barcode' => $data['barcode'] ?? '',
+                'name' => $data['productName'] ?? '',
+                'description' => $data['productDescription'] ?? '',
+                'price' => $data['price'] ?? 0,
+                'stock' => $data['availableStock'] ?? 0,
+                'image_url' => $images[0] ?? '',
+                'additional_images' => array_slice($images, 1)
+            ];
+        }
+        elseif ($marketplace == 'n11') {
+            $images = [];
+            if (!empty($data['images']['image']) && is_array($data['images']['image'])) {
+                foreach ($data['images']['image'] as $img) {
+                    if (!empty($img['url'])) $images[] = $img['url'];
+                }
+            }
+            
+            return [
+                'marketplace_product_id' => $data['id'] ?? '',
+                'marketplace_sku' => $data['productSellerCode'] ?? '',
+                'sku' => $data['productSellerCode'] ?? '',
+                'barcode' => $data['barcode'] ?? '',
+                'name' => $data['title'] ?? '',
+                'description' => $data['description'] ?? '',
+                'price' => $data['salePrice'] ?? 0,
+                'stock' => $data['stockItems']['stockItem']['quantity'] ?? 0,
+                'image_url' => $images[0] ?? '',
+                'additional_images' => array_slice($images, 1)
+            ];
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Ürünü kaydet veya güncelle
+     */
+    private function saveProductData($productData) {
+        // Ürün var mı kontrol et
+        $stmt = $this->db->prepare("SELECT id FROM products WHERE sku = :sku OR barcode = :barcode");
+        $stmt->execute([':sku' => $productData['sku'], ':barcode' => $productData['barcode']]);
+        $existing = $stmt->fetch();
+        
+        if ($existing) {
+            // Güncelle
+            $stmt = $this->db->prepare("
+                UPDATE products 
+                SET name = :name, description = :description, price = :price, stock = :stock, updated_at = NOW()
+                WHERE id = :id
+            ");
+            $stmt->execute([
+                ':id' => $existing['id'],
+                ':name' => $productData['name'],
+                ':description' => strip_tags($productData['description']),
+                ':price' => $productData['price'],
+                ':stock' => $productData['stock']
+            ]);
+            return $existing['id'];
+        } else {
+            // Yeni ekle
+            $stmt = $this->db->prepare("
+                INSERT INTO products (sku, barcode, name, description, price, stock, is_active)
+                VALUES (:sku, :barcode, :name, :description, :price, :stock, 1)
+            ");
+            $stmt->execute([
+                ':sku' => $productData['sku'],
+                ':barcode' => $productData['barcode'],
+                ':name' => $productData['name'],
+                ':description' => strip_tags($productData['description']),
+                ':price' => $productData['price'],
+                ':stock' => $productData['stock']
+            ]);
+            return $this->db->lastInsertId();
+        }
+    }
+    
+    /**
+     * Pazaryeri eşleştirmesini kaydet
+     */
+    private function saveMarketplaceMappingData($productId, $marketplace, $productData) {
+        $stmt = $this->db->prepare("
+            INSERT INTO marketplace_products (product_id, marketplace, marketplace_product_id, marketplace_sku, last_sync)
+            VALUES (:product_id, :marketplace, :marketplace_product_id, :marketplace_sku, NOW())
+            ON DUPLICATE KEY UPDATE 
+                marketplace_product_id = :marketplace_product_id,
+                marketplace_sku = :marketplace_sku,
+                last_sync = NOW()
+        ");
+        $stmt->execute([
+            ':product_id' => $productId,
+            ':marketplace' => $marketplace,
+            ':marketplace_product_id' => $productData['marketplace_product_id'],
+            ':marketplace_sku' => $productData['marketplace_sku']
+        ]);
+    }
+    
+    /**
+     * Ürün resmini indir ve kaydet
+     */
+    private function downloadProductImage($productId, $imageUrl, $marketplace) {
+        if (empty($imageUrl)) {
+            return null;
+        }
+        
+        try {
+            // Platform klasörünü oluştur
+            $uploadDir = __DIR__ . '/../uploads/' . $marketplace . '/';
+            if (!file_exists($uploadDir)) {
+                mkdir($uploadDir, 0777, true);
+            }
+            
+            // Dosya adı oluştur
+            $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
+            if (empty($extension) || strlen($extension) > 4) {
+                $extension = 'jpg';
+            }
+            $fileName = 'product_' . $productId . '_' . time() . '_' . uniqid() . '.' . $extension;
+            $filePath = $uploadDir . $fileName;
+            
+            // Resmi indir
+            $ch = curl_init($imageUrl);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+            $imageData = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
+                file_put_contents($filePath, $imageData);
+                
+                $relativePath = 'uploads/' . $marketplace . '/' . $fileName;
+                
+                // Veritabanını güncelle
+                $stmt = $this->db->prepare("
+                    UPDATE products 
+                    SET image_url = :image_url 
+                    WHERE id = :id
+                ");
+                $stmt->execute([
+                    ':id' => $productId,
+                    ':image_url' => $relativePath
+                ]);
+                
+                return $relativePath;
+            }
+            
+            return null;
+        } catch (Exception $e) {
+            error_log("Resim indirme hatası: " . $e->getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Ürün için ek resimleri indir
+     */
+    private function downloadAdditionalImages($productId, $images, $marketplace) {
+        if (empty($images) || !is_array($images)) {
+            return;
+        }
+        
+        $sortOrder = 1;
+        foreach ($images as $imageUrl) {
+            if (empty($imageUrl)) continue;
+            
+            try {
+                $uploadDir = __DIR__ . '/../uploads/' . $marketplace . '/';
+                if (!file_exists($uploadDir)) {
+                    mkdir($uploadDir, 0777, true);
+                }
+                
+                $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
+                if (empty($extension) || strlen($extension) > 4) {
+                    $extension = 'jpg';
+                }
+                $fileName = 'product_' . $productId . '_extra_' . $sortOrder . '_' . time() . '.' . $extension;
+                $filePath = $uploadDir . $fileName;
+                
+                $ch = curl_init($imageUrl);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+                $imageData = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+                
+                if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
+                    file_put_contents($filePath, $imageData);
+                    
+                    $relativePath = 'uploads/' . $marketplace . '/' . $fileName;
+                    
+                    $stmt = $this->db->prepare("
+                        INSERT INTO product_images (product_id, image_url, image_path, platform, sort_order, is_main)
+                        VALUES (:product_id, :image_url, :image_path, :platform, :sort_order, 0)
+                    ");
+                    $stmt->execute([
+                        ':product_id' => $productId,
+                        ':image_url' => $relativePath,
+                        ':image_path' => $relativePath,
+                        ':platform' => $marketplace,
+                        ':sort_order' => $sortOrder
+                    ]);
+                    
+                    $sortOrder++;
+                }
+            } catch (Exception $e) {
+                error_log("Ek resim indirme hatası: " . $e->getMessage());
+            }
+        }
+    }
 }
 ?>
