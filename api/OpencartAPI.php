@@ -363,19 +363,161 @@ private function makeRequest($endpoint, $method = 'GET', $data = []) {
         ];
     }
 
+   /**
+     * Ürün resmini indir ve kaydet
+     */
+    public function downloadProductImage($productId, $imageUrl, $db) {
+        if (empty($imageUrl)) {
+            return null;
+        }
+
+        try {
+            // uploads/opencart klasörünü oluştur
+            $uploadDir = __DIR__ . '/../uploads/opencart/';
+            if (!file_exists($uploadDir)) {
+                mkdir($uploadDir, 0777, true);
+            }
+
+            // Tam URL oluştur
+            if (strpos($imageUrl, 'http') !== 0) {
+                $imageUrl = $this->storeUrl . '/image/' . $imageUrl;
+            }
+
+            // Dosya adı oluştur
+            $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
+            if (empty($extension) || strlen($extension) > 4) {
+                $extension = 'jpg';
+            }
+            $fileName = 'product_' . $productId . '_' . time() . '.' . $extension;
+            $filePath = $uploadDir . $fileName;
+
+            // Resmi indir
+            $ch = curl_init($imageUrl);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
+            $imageData = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
+                file_put_contents($filePath, $imageData);
+                
+                $relativePath = 'uploads/opencart/' . $fileName;
+                
+                // Veritabanını güncelle
+                $stmt = $db->prepare("UPDATE products SET image_url = :image_url WHERE id = :id");
+                $stmt->execute([
+                    ':id' => $productId,
+                    ':image_url' => $relativePath
+                ]);
+                
+                return $relativePath;
+            }
+
+            return null;
+
+        } catch (Exception $e) {
+            error_log("Resim indirme hatası: " . $e->getMessage());
+            return null;
+        }
+    }
+
     /**
-     * OpenCart'tan ürünleri panele çek
+     * Ek resimleri indir ve kaydet
+     */
+    public function downloadAdditionalImages($productId, $images, $db) {
+        if (empty($images) || !is_array($images)) {
+            return;
+        }
+
+        try {
+            $uploadDir = __DIR__ . '/../uploads/opencart/';
+            if (!file_exists($uploadDir)) {
+                mkdir($uploadDir, 0777, true);
+            }
+
+            $sortOrder = 1;
+            foreach ($images as $imageUrl) {
+                if (empty($imageUrl)) continue;
+
+                // Tam URL oluştur
+                if (strpos($imageUrl, 'http') !== 0) {
+                    $imageUrl = $this->storeUrl . '/image/' . $imageUrl;
+                }
+
+                // Dosya adı oluştur
+                $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
+                if (empty($extension) || strlen($extension) > 4) {
+                    $extension = 'jpg';
+                }
+                $fileName = 'product_' . $productId . '_extra_' . $sortOrder . '_' . time() . '.' . $extension;
+                $filePath = $uploadDir . $fileName;
+
+                // Resmi indir
+                $ch = curl_init($imageUrl);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
+                $imageData = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+
+                if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
+                    file_put_contents($filePath, $imageData);
+                    
+                    $relativePath = 'uploads/opencart/' . $fileName;
+                    
+                    // product_images tablosuna ekle
+                    $stmt = $db->prepare("
+                        INSERT INTO product_images (product_id, image_url, image_path, platform, sort_order, is_main)
+                        VALUES (:product_id, :image_url, :image_path, 'opencart', :sort_order, 0)
+                    ");
+                    $stmt->execute([
+                        ':product_id' => $productId,
+                        ':image_url' => $relativePath,
+                        ':image_path' => $relativePath,
+                        ':sort_order' => $sortOrder
+                    ]);
+                    
+                    $sortOrder++;
+                }
+            }
+
+        } catch (Exception $e) {
+            error_log("Ek resim indirme hatası: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * OpenCart'tan ürünleri panele çek (RESİMLERLE BİRLİKTE)
      */
     public function syncProductsToPanel($db) {
         try {
-            $products = $this->getProducts(1000, 1);
+            $result = $this->getProducts(1000, 1);
+            
+            if (isset($result['error'])) {
+                return [
+                    'success' => false,
+                    'message' => $result['error']
+                ];
+            }
+            
+            $products = $result['products'] ?? [];
             $syncedCount = 0;
+            $imageCount = 0;
 
-            foreach ($products['products'] ?? [] as $ocProduct) {
+            foreach ($products as $ocProduct) {
                 // Ürün var mı kontrol et
                 $stmt = $db->prepare("SELECT id FROM products WHERE sku = :sku");
                 $stmt->execute([':sku' => $ocProduct['model']]);
                 $existing = $stmt->fetch();
+
+                $productId = null;
 
                 if ($existing) {
                     // Güncelle
@@ -385,6 +527,7 @@ private function makeRequest($endpoint, $method = 'GET', $data = []) {
                             name = :name, 
                             price = :price, 
                             stock = :stock,
+                            description = :description,
                             updated_at = NOW()
                         WHERE id = :id
                     ");
@@ -393,26 +536,43 @@ private function makeRequest($endpoint, $method = 'GET', $data = []) {
                         ':name' => $ocProduct['name'],
                         ':price' => $ocProduct['price'],
                         ':stock' => $ocProduct['quantity'],
+                        ':description' => strip_tags($ocProduct['description'] ?? ''),
                         ':id' => $existing['id']
                     ]);
+                    $productId = $existing['id'];
                 } else {
                     // Yeni ekle
                     $stmt = $db->prepare("
                         INSERT INTO products (
-                            opencart_id, sku, name, description, price, stock, barcode
+                            opencart_id, sku, name, description, price, stock, barcode, is_active
                         ) VALUES (
-                            :opencart_id, :sku, :name, :description, :price, :stock, :barcode
+                            :opencart_id, :sku, :name, :description, :price, :stock, :barcode, 1
                         )
                     ");
                     $stmt->execute([
                         ':opencart_id' => $ocProduct['product_id'],
                         ':sku' => $ocProduct['model'],
                         ':name' => $ocProduct['name'],
-                        ':description' => $ocProduct['description'] ?? '',
+                        ':description' => strip_tags($ocProduct['description'] ?? ''),
                         ':price' => $ocProduct['price'],
                         ':stock' => $ocProduct['quantity'],
                         ':barcode' => $ocProduct['ean'] ?? ''
                     ]);
+                    $productId = $db->lastInsertId();
+                }
+
+                // Ana resmi indir
+                if (!empty($ocProduct['image'])) {
+                    $downloaded = $this->downloadProductImage($productId, $ocProduct['image'], $db);
+                    if ($downloaded) {
+                        $imageCount++;
+                    }
+                }
+
+                // Ek resimleri indir
+                if (!empty($ocProduct['images']) && is_array($ocProduct['images'])) {
+                    $this->downloadAdditionalImages($productId, $ocProduct['images'], $db);
+                    $imageCount += count($ocProduct['images']);
                 }
 
                 $syncedCount++;
@@ -420,7 +580,11 @@ private function makeRequest($endpoint, $method = 'GET', $data = []) {
 
             return [
                 'success' => true,
-                'message' => "{$syncedCount} ürün senkronize edildi"
+                'message' => "{$syncedCount} ürün, {$imageCount} resim senkronize edildi",
+                'data' => [
+                    'products' => $syncedCount,
+                    'images' => $imageCount
+                ]
             ];
 
         } catch (Exception $e) {
