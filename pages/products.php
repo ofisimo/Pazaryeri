@@ -802,26 +802,29 @@ function syncProducts(source, direction) {
     btn.disabled = true;
     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> İşleniyor...';
     
+    // FormData kullan
+    const formData = new FormData();
+    formData.append('source', source);
+    formData.append('direction', direction);
+    
     fetch('ajax/sync-products.php', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: 'source=' + encodeURIComponent(source) + '&direction=' + encodeURIComponent(direction)
+        body: formData
     })
     .then(response => response.json())
     .then(data => {
         btn.disabled = false;
         btn.innerHTML = originalText;
         
-   if (data.success) {
+        if (data.success) {
             alert('✓ ' + data.message);
             location.reload();
         } else {
             // Debug bilgisini de göster
             let msg = '✗ ' + data.message;
             if (data.debug) {
-                msg += '\n\nDebug: ' + JSON.stringify(data.debug, null, 2);
+                console.log('Debug:', data.debug);
+                msg += '\n\nDebug bilgisi console\'da';
             }
             alert(msg);
         }
@@ -830,6 +833,7 @@ function syncProducts(source, direction) {
         btn.disabled = false;
         btn.innerHTML = originalText;
         alert('Senkronizasyon sırasında bir hata oluştu: ' + error);
+        console.error('Error:', error);
     });
 }
 
