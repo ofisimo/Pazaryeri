@@ -42,14 +42,22 @@ try {
             exit;
         }
         
+		
+		
         $ocProducts = $response['products'] ?? [];
         
         $imported = 0;
         $updated = 0;
         $variantsAdded = 0;
-        $imagesDownloaded = 0; // Resim sayacı ekledik
         
         foreach ($ocProducts as $ocProduct) {
+			     $imported++;
+                    $productId = $db->lastInsertId();
+                    
+                    // Resimleri indir ve kaydet
+                    if (!empty($ocProduct['images'])) {
+                        ImageHelper::saveProductImages($db, $productId, $ocProduct['images'], 'opencart');
+                    }
             // Ana ürün kontrolü
             $stmt = $db->prepare("SELECT id FROM products WHERE sku = :sku OR opencart_id = :opencart_id");
             $stmt->execute([
@@ -69,6 +77,7 @@ try {
                         name = :name, 
                         price = :price, 
                         stock = :stock,
+                        image_url = :image,
                         has_variants = :has_variants,
                         updated_at = NOW()
                     WHERE id = :id
@@ -78,6 +87,7 @@ try {
                     ':name' => $ocProduct['name'],
                     ':price' => $ocProduct['price'] ?? 0,
                     ':stock' => $ocProduct['quantity'] ?? 0,
+                    ':image' => $ocProduct['image'] ?? '',
                     ':has_variants' => $hasVariants ? 1 : 0,
                     ':id' => $existing['id']
                 ]);
@@ -86,8 +96,8 @@ try {
             } else {
                 // Yeni ana ürün ekle
                 $stmt = $db->prepare("
-                    INSERT INTO products (opencart_id, sku, name, description, price, stock, barcode, has_variants)
-                    VALUES (:opencart_id, :sku, :name, :description, :price, :stock, :barcode, :has_variants)
+                    INSERT INTO products (opencart_id, sku, name, description, price, stock, barcode, image_url, has_variants)
+                    VALUES (:opencart_id, :sku, :name, :description, :price, :stock, :barcode, :image, :has_variants)
                 ");
                 $stmt->execute([
                     ':opencart_id' => $ocProduct['product_id'],
@@ -97,33 +107,12 @@ try {
                     ':price' => $ocProduct['price'] ?? 0,
                     ':stock' => $ocProduct['quantity'] ?? 0,
                     ':barcode' => $ocProduct['ean'] ?? '',
+                    ':image' => $ocProduct['image'] ?? '',
                     ':has_variants' => $hasVariants ? 1 : 0
                 ]);
                 $imported++;
                 $productId = $db->lastInsertId();
             }
-            
-            // ============ RESİM İNDİRME BAŞLANGIÇ ============
-            // Ana resmi indir
-            if (!empty($ocProduct['image'])) {
-                $imageUrl = downloadProductImage($productId, $ocProduct['image'], 'opencart', $db);
-                if ($imageUrl) {
-                    $imagesDownloaded++;
-                }
-            }
-            
-            // Ek resimleri indir
-            if (!empty($ocProduct['images']) && is_array($ocProduct['images'])) {
-                foreach ($ocProduct['images'] as $image) {
-                    if (!empty($image)) {
-                        $result = downloadAdditionalImage($productId, $image, 'opencart', $db);
-                        if ($result) {
-                            $imagesDownloaded++;
-                        }
-                    }
-                }
-            }
-            // ============ RESİM İNDİRME BİTİŞ ============
             
             // Varyantları işle
             if ($hasVariants) {
@@ -199,7 +188,7 @@ try {
         
         echo json_encode([
             'success' => true, 
-            'message' => "{$imported} ürün eklendi, {$updated} ürün güncellendi, {$variantsAdded} varyant ve {$imagesDownloaded} resim eklendi"
+            'message' => "{$imported} ürün eklendi, {$updated} ürün güncellendi, {$variantsAdded} varyant eklendi"
         ]);
     } else {
         echo json_encode(['success' => false, 'message' => 'Bu işlem henüz desteklenmiyor']);
@@ -208,126 +197,3 @@ try {
 } catch (Exception $e) {
     echo json_encode(['success' => false, 'message' => 'Hata: ' . $e->getMessage()]);
 }
-
-// ============ RESİM İNDİRME FONKSİYONLARI ============
-
-/**
- * Ana ürün resmini indir
- */
-function downloadProductImage($productId, $imageUrl, $platform, $db) {
-    if (empty($imageUrl)) return null;
-    
-    try {
-        // uploads/opencart klasörünü oluştur
-        $uploadDir = __DIR__ . '/../uploads/' . $platform . '/';
-        if (!file_exists($uploadDir)) {
-            mkdir($uploadDir, 0777, true);
-        }
-        
-        // Tam URL oluştur (OpenCart için)
-        if (strpos($imageUrl, 'http') !== 0) {
-            // OpenCart image path'i
-            $imageUrl = 'https://kelebeksoft.com/image/' . $imageUrl;
-        }
-        
-        // Dosya adı
-        $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
-        if (empty($extension) || strlen($extension) > 4) {
-            $extension = 'jpg';
-        }
-        $fileName = 'product_' . $productId . '_' . time() . '.' . $extension;
-        $filePath = $uploadDir . $fileName;
-        
-        // Resmi indir
-        $ch = curl_init($imageUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
-        $imageData = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        
-        if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
-            file_put_contents($filePath, $imageData);
-            
-            $relativePath = 'uploads/' . $platform . '/' . $fileName;
-            
-            // Veritabanını güncelle
-            $stmt = $db->prepare("UPDATE products SET image_url = :image_url WHERE id = :id");
-            $stmt->execute([':id' => $productId, ':image_url' => $relativePath]);
-            
-            return $relativePath;
-        }
-        
-        return null;
-    } catch (Exception $e) {
-        error_log("Resim indirme hatası: " . $e->getMessage());
-        return null;
-    }
-}
-
-/**
- * Ek resim indir
- */
-function downloadAdditionalImage($productId, $imageUrl, $platform, $db) {
-    if (empty($imageUrl)) return false;
-    
-    try {
-        $uploadDir = __DIR__ . '/../uploads/' . $platform . '/';
-        if (!file_exists($uploadDir)) {
-            mkdir($uploadDir, 0777, true);
-        }
-        
-        // Tam URL oluştur
-        if (strpos($imageUrl, 'http') !== 0) {
-            $imageUrl = 'https://kelebeksoft.com/image/' . $imageUrl;
-        }
-        
-        // Dosya adı
-        $extension = pathinfo(parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION);
-        if (empty($extension) || strlen($extension) > 4) {
-            $extension = 'jpg';
-        }
-        $fileName = 'product_' . $productId . '_extra_' . time() . '_' . uniqid() . '.' . $extension;
-        $filePath = $uploadDir . $fileName;
-        
-        // Resmi indir
-        $ch = curl_init($imageUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
-        $imageData = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        
-        if ($httpCode == 200 && $imageData && strlen($imageData) > 100) {
-            file_put_contents($filePath, $imageData);
-            
-            $relativePath = 'uploads/' . $platform . '/' . $fileName;
-            
-            // product_images tablosuna ekle
-            $stmt = $db->prepare("
-                INSERT INTO product_images (product_id, image_url, image_path, platform, sort_order, is_main)
-                VALUES (:product_id, :image_url, :image_path, :platform, 1, 0)
-            ");
-            $stmt->execute([
-                ':product_id' => $productId,
-                ':image_url' => $relativePath,
-                ':image_path' => $relativePath,
-                ':platform' => $platform
-            ]);
-            
-            return true;
-        }
-        
-        return false;
-    } catch (Exception $e) {
-        error_log("Ek resim indirme hatası: " . $e->getMessage());
-        return false;
-    }
-}
-?>
