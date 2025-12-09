@@ -11,7 +11,7 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 $page = isset($_GET['page']) ? $_GET['page'] : 'dashboard';
-$allowed_pages = ['dashboard', 'products', 'orders', 'settings', 'trendyol', 'hepsiburada', 'n11', 'categories', 'category-mappings', 'category-edit', 'category-add', 'product-add'];
+$allowed_pages = ['dashboard', 'products', 'orders', 'settings', 'platform-sync-settings', 'trendyol', 'hepsiburada', 'n11', 'opencart', 'categories', 'category-mappings', 'category-edit', 'category-add', 'product-add'];
 
 if (!in_array($page, $allowed_pages)) {
     $page = 'dashboard';
@@ -54,12 +54,25 @@ if (!in_array($page, $allowed_pages)) {
                     <a href="?page=hepsiburada"><i class="fas fa-shopping-basket"></i> Hepsiburada</a>
                 </li>
                 <li class="<?php echo $page == 'n11' ? 'active' : ''; ?>">
-                    <a href="?page=n11"><i class="fas fa-store-alt"></i> N11</a>
+                    <a href="?page=n11"><i class="fas fa-shopping-cart"></i> N11</a>
                 </li>
+                <li class="<?php echo $page == 'opencart' ? 'active' : ''; ?>">
+                    <a href="?page=opencart"><i class="fas fa-store-alt"></i> OpenCart</a>
+                </li>
+				
                 <li class="menu-title">Ayarlar</li>
+				
                 <li class="<?php echo $page == 'settings' ? 'active' : ''; ?>">
                     <a href="?page=settings"><i class="fas fa-cog"></i> Ayarlar</a>
                 </li>
+				
+				
+<li class="<?php echo $page == 'platform-sync-settings' ? 'active' : ''; ?>">
+    <a href="?page=platform-sync-settings">
+        <i class="fas fa-sync-alt"></i>
+        Platform Seçenekleri
+    </a>
+</li>
             </ul>
         </nav>
 
